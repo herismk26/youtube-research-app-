@@ -1,0 +1,6 @@
+streamlit
+google-api-python-client
+google-generativeai
+pandas
+isodate
+plotly
