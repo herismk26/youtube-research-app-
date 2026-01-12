@@ -4,385 +4,246 @@ from googleapiclient.errors import HttpError
 import google.generativeai as genai
 import pandas as pd
 import isodate
-from datetime import datetime, timedelta # Library waktu
+from datetime import datetime, timedelta
 
-# --- KONFIGURASI HALAMAN ---
-st.set_page_config(
-    page_title="YouTube Trend Intelligence Pro",
-    page_icon="📹",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# --- KONFIGURASI ---
+st.set_page_config(page_title="YouTube Trend Pro +", page_icon="📹", layout="wide", initial_sidebar_state="expanded")
 
-# --- FUNGSI HELPER & LOGIKA DATA ---
-
+# --- FUNGSI HELPER & DATA ---
 def parse_duration(duration_str):
-    """Mengubah format durasi YouTube (PT1H2M10S) ke detik."""
     try:
         if not duration_str: return 0
-        duration = isodate.parse_duration(duration_str)
-        return duration.total_seconds()
-    except:
-        return 0
+        return isodate.parse_duration(duration_str).total_seconds()
+    except: return 0
 
 def get_channel_stats(youtube, channel_ids):
-    """Mengambil data subscriber untuk banyak channel sekaligus."""
     try:
         unique_ids = list(set(channel_ids))
         stats = {}
-        # Batching 50 ID per request
         for i in range(0, len(unique_ids), 50):
             chunk = unique_ids[i:i+50]
             if not chunk: continue
-            
-            request = youtube.channels().list(
-                part="statistics",
-                id=','.join(chunk)
-            )
-            response = request.execute()
-            
-            for item in response.get('items', []):
-                sub_count = int(item['statistics'].get('subscriberCount', 0))
-                stats[item['id']] = sub_count
+            req = youtube.channels().list(part="statistics", id=','.join(chunk))
+            res = req.execute()
+            for item in res.get('items', []):
+                stats[item['id']] = int(item['statistics'].get('subscriberCount', 0))
         return stats
-    except Exception:
-        return {}
+    except: return {}
 
 def process_video_items(items, youtube_service=None):
-    """Mengolah JSON mentah menjadi DataFrame lengkap dengan Subscriber."""
     data = []
     if not items: return pd.DataFrame()
     
-    # 1. Kumpulkan Channel ID
-    channel_ids = []
-    for item in items:
-        snippet = item.get('snippet', {})
-        c_id = snippet.get('channelId')
-        if c_id: channel_ids.append(c_id)
-            
-    # 2. Ambil Data Subscriber
+    # 1. Channel IDs
+    channel_ids = [item['snippet'].get('channelId') for item in items if 'snippet' in item]
+    
+    # 2. Subscribers
     channel_stats = {}
     if youtube_service and channel_ids:
         channel_stats = get_channel_stats(youtube_service, channel_ids)
     
-    # 3. Gabungkan Data
+    # 3. Process
     for item in items:
-        video_id = item['id'] if isinstance(item['id'], str) else item['id'].get('videoId')
-        if not video_id: continue
+        vid_id = item['id'] if isinstance(item['id'], str) else item['id'].get('videoId')
+        if not vid_id: continue
             
-        snippet = item.get('snippet', {})
-        statistics = item.get('statistics', {})
-        content_details = item.get('contentDetails', {})
+        snip = item.get('snippet', {})
+        stat = item.get('statistics', {})
+        content = item.get('contentDetails', {})
         
-        view_count = int(statistics.get('viewCount', 0))
-        like_count = int(statistics.get('likeCount', 0))
-        comment_count = int(statistics.get('commentCount', 0))
-        engagement = ((like_count + comment_count) / view_count * 100) if view_count > 0 else 0
-        
-        duration_sec = parse_duration(content_details.get('duration', 'PT0S'))
-        
-        ch_id = snippet.get('channelId')
-        subs_count = channel_stats.get(ch_id, 0)
+        view = int(stat.get('viewCount', 0))
+        like = int(stat.get('likeCount', 0))
+        comment = int(stat.get('commentCount', 0))
+        eng = ((like + comment) / view * 100) if view > 0 else 0
+        dur_sec = parse_duration(content.get('duration', 'PT0S'))
         
         data.append({
-            'Video ID': video_id,
-            'Title': snippet.get('title', ''),
-            'Channel': snippet.get('channelTitle', ''),
-            'Subscribers': subs_count,
-            'Views': view_count,
-            'Likes': like_count,
-            'Comments': comment_count,
-            'Engagement (%)': round(engagement, 2),
-            'Duration (Min)': round(duration_sec / 60, 2),
-            'Publish Date': snippet.get('publishedAt', '').split('T')[0],
-            'Thumbnail': snippet.get('thumbnails', {}).get('high', {}).get('url', ''),
-            'Tags': snippet.get('tags', []),
-            'URL': f"https://www.youtube.com/watch?v={video_id}"
+            'Video ID': vid_id,
+            'Title': snip.get('title', ''),
+            'Channel': snip.get('channelTitle', ''),
+            'Subscribers': channel_stats.get(snip.get('channelId'), 0),
+            'Views': view,
+            'Engagement (%)': round(eng, 2),
+            'Duration (Min)': round(dur_sec / 60, 2),
+            'Publish Date': snip.get('publishedAt', '').split('T')[0],
+            'Thumbnail': snip.get('thumbnails', {}).get('high', {}).get('url', ''),
+            'Tags': snip.get('tags', []),
+            'URL': f"https://www.youtube.com/watch?v={vid_id}"
         })
-    
     return pd.DataFrame(data)
 
-# --- FUNGSI AI GENERATOR (AUTO-DETECT) ---
+# --- AI ---
 def generate_ai_strategy(api_key, video_data, topic):
-    """Mengirim data trending ke Gemini dengan Auto-Detect Model."""
     try:
         genai.configure(api_key=api_key)
+        # Auto Model
+        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        sel_model = next((m for m in ['models/gemini-1.5-flash', 'models/gemini-pro'] if m in models), models[0] if models else "")
         
-        # 1. Cek model tersedia
-        available_models = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                available_models.append(m.name)
+        if not sel_model: return "❌ No AI Model found."
         
-        # 2. Pilih prioritas
-        selected_model = ""
-        priorities = ['models/gemini-1.5-flash', 'models/gemini-pro', 'models/gemini-1.0-pro']
-        for p in priorities:
-            if p in available_models:
-                selected_model = p
-                break
-        
-        if not selected_model and available_models:
-            selected_model = available_models[0]
-            
-        if not selected_model:
-            return "❌ Tidak ada model AI yang aktif."
+        model = genai.GenerativeModel(sel_model)
+        data_text = "\n".join([f"{i+1}. {v['Title']} ({v['Views']} views)" for i, v in enumerate(video_data[:5])])
+        prompt = f"Analisa top 5 video '{topic}':\n{data_text}\n\nBerikan 3 ide judul viral, analisa kenapa laku, dan saran thumbnail. Bahasa Indonesia."
+        return f"**AI Model: {sel_model}**\n\n" + model.generate_content(prompt).text
+    except Exception as e: return f"Error AI: {str(e)}"
 
-        # 3. Generate
-        model = genai.GenerativeModel(selected_model)
-        
-        data_text = ""
-        for i, vid in enumerate(video_data[:5]): 
-            data_text += f"{i+1}. {vid['Title']} (Views: {vid['Views']}, Channel: {vid['Channel']})\n"
-            
-        prompt = f"""
-        Saya YouTuber pemula niche '{topic}'.
-        Data kompetitor trending:
-        {data_text}
-        
-        Berikan saran strategi:
-        1. 3 Ide Judul Video Baru (Pola ATM).
-        2. Analisis Singkat: Kenapa video ini laku?
-        3. Saran Thumbnail: Warna & Objek.
-        
-        Jawab Bahasa Indonesia santai & Markdown.
-        """
-        
-        response = model.generate_content(prompt)
-        return f"**Model AI: {selected_model}**\n\n" + response.text
-        
-    except Exception as e:
-        return f"❌ Error AI: {str(e)}"
-
-# --- FUNGSI API YOUTUBE (DENGAN FILTER) ---
-
-def get_youtube_service(api_key):
-    try:
-        return build('youtube', 'v3', developerKey=api_key)
-    except Exception:
-        return None
-
-def validate_api_key(api_service):
-    try:
-        request = api_service.videos().list(part="id", chart="mostPopular", regionCode="ID", maxResults=1)
-        request.execute()
-        return True
-    except HttpError as e:
-        if e.resp.status == 403: return "QUOTA_EXCEEDED"
-        return "INVALID_KEY"
-    except Exception:
-        return "ERROR"
+# --- API CALLS ---
+def get_yt_service(key):
+    try: return build('youtube', 'v3', developerKey=key)
+    except: return None
 
 @st.cache_data(show_spinner=False)
-def get_trending_videos(api_key, region_code="ID", max_results=50):
-    youtube = build('youtube', 'v3', developerKey=api_key)
+def get_data(api_key, mode, query, region, max_res, pub_after):
+    yt = get_yt_service(api_key)
     try:
-        request = youtube.videos().list(
-            part="snippet,contentDetails,statistics",
-            chart="mostPopular",
-            regionCode=region_code,
-            maxResults=max_results
-        )
-        response = request.execute()
-        return process_video_items(response.get('items', []), youtube_service=youtube) 
+        if mode == "Trending Umum":
+            req = yt.videos().list(part="snippet,contentDetails,statistics", chart="mostPopular", regionCode=region, maxResults=max_res)
+            return process_video_items(req.execute().get('items', []), yt)
+        else:
+            params = {"part": "id", "q": query, "type": "video", "regionCode": region, "maxResults": max_res}
+            if pub_after: params["publishedAfter"] = pub_after
+            res = yt.search().list(**params).execute()
+            ids = [i['id']['videoId'] for i in res.get('items', [])]
+            if not ids: return pd.DataFrame()
+            req_v = yt.videos().list(part="snippet,contentDetails,statistics", id=','.join(ids))
+            return process_video_items(req_v.execute().get('items', []), yt)
     except Exception as e:
-        st.error(f"Error Trending: {e}")
+        st.error(f"Error: {e}")
         return pd.DataFrame()
 
-@st.cache_data(show_spinner=False)
-def search_videos_niche(api_key, query, region_code="ID", max_results=50, published_after=None):
-    youtube = build('youtube', 'v3', developerKey=api_key)
-    try:
-        search_params = {
-            "part": "id",
-            "q": query,
-            "type": "video",
-            "regionCode": region_code,
-            "maxResults": max_results
-        }
-        if published_after:
-            search_params["publishedAfter"] = published_after
-
-        # Step 1: Search IDs
-        search_request = youtube.search().list(**search_params)
-        search_response = search_request.execute()
-        video_ids = [item['id']['videoId'] for item in search_response.get('items', [])]
-        
-        if not video_ids: return pd.DataFrame()
-            
-        # Step 2: Details
-        videos_request = youtube.videos().list(part="snippet,contentDetails,statistics", id=','.join(video_ids))
-        videos_response = videos_request.execute()
-        
-        return process_video_items(videos_response.get('items', []), youtube_service=youtube)
-    except Exception as e:
-        st.error(f"Error Search: {e}")
-        return pd.DataFrame()
-
-# --- SIDEBAR CONTROL ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Konfigurasi")
-    
-    # KEYS
-    st.markdown("**1. YouTube Key**")
     if 'api_key' not in st.session_state: st.session_state.api_key = ''
-    api_key_input = st.text_input("YouTube API Key", type="password", value=st.session_state.api_key, key="yt_input")
+    st.session_state.api_key = st.text_input("YouTube Key", type="password", value=st.session_state.api_key)
     
-    if api_key_input:
-        st.session_state.api_key = api_key_input
-        youtube = get_youtube_service(api_key_input)
-        if st.button("Validasi Key"):
-            res = validate_api_key(youtube)
-            if res == True:
-                st.success("✅ Terhubung!")
-                st.session_state.is_valid = True
-            else:
-                st.error("❌ Key Bermasalah")
-                st.session_state.is_valid = False
-
-    st.markdown("**2. Gemini AI Key (Opsional)**")
     if 'gemini_key' not in st.session_state: st.session_state.gemini_key = ''
-    gemini_key_input = st.text_input("Gemini Key", type="password", value=st.session_state.gemini_key, key="ai_input")
-    if gemini_key_input: st.session_state.gemini_key = gemini_key_input
-
+    st.session_state.gemini_key = st.text_input("Gemini Key (Opsional)", type="password", value=st.session_state.gemini_key)
+    
     st.divider()
-
-    # FILTER RISET
-    st.subheader("🕵️ Mode & Filter")
-    research_mode = st.radio("Metode:", ["Trending Umum", "Pencarian Niche"])
+    st.subheader("Filter Riset")
+    mode = st.radio("Mode:", ["Trending Umum", "Pencarian Niche"])
+    time_opt = st.selectbox("Waktu:", ["Semua", "Hari Ini", "Minggu Ini", "Bulan Ini"])
+    max_res = st.slider("Jml Data:", 10, 50, 10, 5)
     
-    # Filter Waktu
-    time_filter = st.selectbox(
-        "Waktu Upload:",
-        ["Semua Waktu", "Hari Ini (24 Jam)", "Minggu Ini (7 Hari)", "Bulan Ini (30 Hari)"],
-        index=0
-    )
+    st.markdown("---")
+    # FILTER BARU
+    sort_opt = st.selectbox("Urutkan:", ["Views Terbanyak", "Paling Baru", "Engagement Tinggi", "Subs Terbanyak"])
+    dur_opt = st.radio("Durasi:", ["Semua", "Shorts (<1m)", "Pendek (1-5m)", "Sedang (5-20m)", "Panjang (>20m)"])
     
-    # Filter Jumlah
-    max_results_filter = st.slider("Jumlah Data:", 10, 50, 10, 5)
+    region = st.selectbox("Wilayah:", ["ID", "US", "KR", "JP"])
+    query = st.text_input("Keyword:") if mode == "Pencarian Niche" else ""
 
-    target_region = st.selectbox("Wilayah:", ["ID", "US", "KR", "JP"], index=0)
-    
-    search_query = ""
-    if research_mode == "Pencarian Niche":
-        search_query = st.text_input("Kata Kunci:", placeholder="Contoh: Tutorial Masak")
+# --- MAIN ---
+st.title("📹 YouTube Trend Pro +")
 
-# --- MAIN DASHBOARD ---
-st.title("📹 YouTube Trend Intelligence Pro")
+if st.session_state.api_key:
+    # Logic Waktu
+    pub_after = None
+    days = {"Hari Ini": 1, "Minggu Ini": 7, "Bulan Ini": 30}.get(time_opt, 0)
+    if days: pub_after = (datetime.utcnow() - timedelta(days=days)).isoformat("T") + "Z"
 
-if st.session_state.get('is_valid'):
-    
-    # LOGIKA WAKTU
-    published_after_param = None
-    filter_days = 0
-    if time_filter == "Hari Ini (24 Jam)":
-        filter_days = 1
-        published_after_param = (datetime.utcnow() - timedelta(days=1)).isoformat("T") + "Z"
-    elif time_filter == "Minggu Ini (7 Hari)":
-        filter_days = 7
-        published_after_param = (datetime.utcnow() - timedelta(days=7)).isoformat("T") + "Z"
-    elif time_filter == "Bulan Ini (30 Hari)":
-        filter_days = 30
-        published_after_param = (datetime.utcnow() - timedelta(days=30)).isoformat("T") + "Z"
-
-    # EKSEKUSI
-    if research_mode == "Trending Umum":
-        st.info(f"Analisis **Top {max_results_filter} Trending** wilayah **{target_region}** ({time_filter}).")
-        if st.button("🚀 Mulai Analisa"):
-            with st.spinner('Menarik data...'):
-                df_result = get_trending_videos(st.session_state.api_key, region_code=target_region, max_results=max_results_filter)
-                
-                if not df_result.empty:
-                    # Filter Waktu Manual untuk Trending
-                    if filter_days > 0:
-                        cutoff_date = (datetime.now() - timedelta(days=filter_days)).date()
-                        df_result['Publish Date Obj'] = pd.to_datetime(df_result['Publish Date']).dt.date
-                        df_result = df_result[df_result['Publish Date Obj'] >= cutoff_date]
-                        df_result = df_result.drop(columns=['Publish Date Obj'])
-                    
-                    if not df_result.empty:
-                        # Limit ulang sesuai slider
-                        st.session_state.df_result = df_result.head(max_results_filter)
-                        st.success(f"Dapat {len(st.session_state.df_result)} video!")
-                    else:
-                        st.warning(f"Tidak ada trending baru dalam {time_filter}.")
-                else:
-                    st.warning("Gagal ambil data.")
-
-    elif research_mode == "Pencarian Niche":
-        if search_query:
-            st.info(f"Riset topik: **{search_query}** ({time_filter}).")
-            if st.button("🚀 Mulai Deep Dive"):
-                with st.spinner('Menarik data niche...'):
-                    df_result = search_videos_niche(
-                        st.session_state.api_key, 
-                        query=search_query, 
-                        region_code=target_region,
-                        max_results=max_results_filter,
-                        published_after=published_after_param
-                    )
-                    if not df_result.empty:
-                        st.session_state.df_result = df_result
-                        st.success(f"Dapat {len(df_result)} video!")
-                    else:
-                        st.warning("Tidak ada video ditemukan.")
+    if st.button("🚀 Mulai Riset"):
+        if mode == "Pencarian Niche" and not query: st.warning("Isi keyword!")
         else:
-            st.warning("Isi kata kunci dulu.")
+            with st.spinner("Mengambil data..."):
+                df = get_data(st.session_state.api_key, mode, query, region, max_res, pub_after)
+                if not df.empty:
+                    # Filter Manual Trending Waktu
+                    if mode == "Trending Umum" and days:
+                        cut = (datetime.now() - timedelta(days=days)).date()
+                        df = df[pd.to_datetime(df['Publish Date']).dt.date >= cut]
+                    st.session_state.df_result = df
+                    if df.empty: st.warning("Data kosong setelah filter waktu.")
+                else: st.warning("Data tidak ditemukan.")
 
-    # VISUALISASI KARTU
+    # VISUALISASI DENGAN FILTER BARU
     if 'df_result' in st.session_state and not st.session_state.df_result.empty:
-        df = st.session_state.df_result
+        df_show = st.session_state.df_result.copy()
+        
+        # Filter Durasi
+        if dur_opt == "Shorts (<1m)": df_show = df_show[df_show['Duration (Min)'] < 1]
+        elif dur_opt == "Pendek (1-5m)": df_show = df_show[(df_show['Duration (Min)'] >= 1) & (df_show['Duration (Min)'] <= 5)]
+        elif dur_opt == "Sedang (5-20m)": df_show = df_show[(df_show['Duration (Min)'] > 5) & (df_show['Duration (Min)'] <= 20)]
+        elif dur_opt == "Panjang (>20m)": df_show = df_show[df_show['Duration (Min)'] > 20]
+        
+        # Sorting
+        if sort_opt == "Views Terbanyak": df_show = df_show.sort_values("Views", ascending=False)
+        elif sort_opt == "Paling Baru": df_show = df_show.sort_values("Publish Date", ascending=False)
+        elif sort_opt == "Engagement Tinggi": df_show = df_show.sort_values("Engagement (%)", ascending=False)
+        elif sort_opt == "Subs Terbanyak": df_show = df_show.sort_values("Subscribers", ascending=False)
         
         st.divider()
-        st.subheader(f"🔥 Hasil Analisis ({len(df)} Video)")
-        
-        top_videos = df.sort_values(by="Views", ascending=False)
-        
-        for index, row in top_videos.iterrows():
-            with st.container():
-                col1, col2, col3 = st.columns([1, 2, 1])
-                
-                with col1:
-                    st.image(row['Thumbnail'], use_container_width=True)
-                
-                with col2:
-                    st.markdown(f"#### [{row['Title']}]({row['URL']})")
-                    st.markdown(f"**Channel:** {row['Channel']}")
-                    
-                    views, subs = row['Views'], row['Subscribers']
-                    if subs > 0:
-                        ratio = views / subs
-                        if ratio > 5: st.success(f"🚀 **VIRAL:** Views {round(ratio,1)}x Subs!")
-                        elif ratio > 1: st.info("📈 **GOOD:** Views > Subs")
-                    
-                    st.caption(f"📅 {row['Publish Date']} | ⏱️ {row['Duration (Min)']} Min")
-
-                    with st.expander("🔍 Detail (Tags & ID)"):
-                        tags = row['Tags']
-                        if tags: st.code(", ".join(tags), language="text")
-                        else: st.caption("Tanpa tags.")
-                        st.markdown(f"[Download Thumbnail]({row['Thumbnail']})")
-                        st.text_input("ID:", row['Video ID'], key=f"v_{index}")
-
-                with col3:
-                    st.metric("Views", f"{views:,}")
-                    st.metric("Subs", f"{subs:,}")
-                    eng = row['Engagement (%)']
-                    st.metric("Engagement", f"{eng}%", delta="High" if eng > 5 else None)
-
-            st.divider()
-
-        # AI STRATEGIST
-        st.header("🤖 AI Content Strategist")
-        if st.session_state.get('gemini_key'):
-            if st.button("✨ Minta Saran AI", type="primary"):
-                with st.spinner("AI sedang berpikir..."):
-                    topic = search_query if research_mode == "Pencarian Niche" else f"Trending {target_region}"
-                    result = generate_ai_strategy(st.session_state.gemini_key, df.to_dict('records'), topic)
-                    st.success("Selesai!")
-                    st.markdown(result)
+        if len(df_show) == 0:
+            st.warning(f"Tidak ada video durasi '{dur_opt}' dari hasil pencarian.")
         else:
-            st.info("Masukkan Gemini Key untuk fitur ini.")
+            st.subheader(f"🔥 Hasil: {len(df_show)} Video")
+                        # ... (bagian loop visualisasi) ...
+            
+                        # LOOP VISUALISASI (VERSI HIGH VISIBILITY)
+            for i, row in df_show.iterrows():
+                
+                # Logic Viral: Hitung Rasio Views vs Subs
+                is_viral = False
+                viral_ratio = 0
+                if row['Subscribers'] > 0:
+                    viral_ratio = row['Views'] / row['Subscribers']
+                    if viral_ratio >= 5.0: # Ambang batas viral (5x lipat subs)
+                        is_viral = True
 
+                # Container Kartu
+                with st.container(border=True): # Tambah border biar rapi
+                    
+                    # Jika Viral, beri tanda spesial di paling atas
+                    if is_viral:
+                        st.warning(f"🔥 **SUPER VIRAL!** (Views {round(viral_ratio, 1)}x lebih banyak dari Subscriber)")
+                    
+                    c1, c2, c3 = st.columns([1, 2, 1])
+                    
+                    # Kolom 1: Gambar
+                    with c1: 
+                        st.image(row['Thumbnail'], use_container_width=True)
+                    
+                    # Kolom 2: Detail
+                    with c2:
+                        # Judul
+                        st.markdown(f"#### [{row['Title']}]({row['URL']})")
+                        
+                        # Info Meta
+                        st.caption(f"📺 {row['Channel']} | 📅 {row['Publish Date']} | ⏱️ {row['Duration (Min)']} Menit")
+                        
+                        # Expander Detail
+                        with st.expander("🔍 Intip Resep (Tags & ID)"):
+                            tags = row['Tags']
+                            if isinstance(tags, list) and len(tags) > 0:
+                                st.markdown("**Tags:**")
+                                st.code(", ".join(tags), language='text')
+                            else:
+                                st.caption("Tanpa tags.")
+                            
+                            st.markdown(f"🖼️ [Download Thumbnail]({row['Thumbnail']})")
+                            st.text_input("Copy ID", row['Video ID'], key=f"vid_{row['Video ID']}") # Key aman
+
+                    # Kolom 3: Metrik
+                    with c3:
+                        # Warna angka Views jadi hijau jika viral
+                        st.metric("Views", f"{row['Views']:,}", delta="Viral" if is_viral else None)
+                        st.metric("Eng. Rate", f"{row['Engagement (%)']}%")
+                        st.metric("Subs", f"{row['Subscribers']:,}")
+                        
+                        # Tombol CTA (Call to Action)
+                        if is_viral:
+                             st.caption("✅ **Rekomendasi ATM**")
+                
+                # Jarak antar kartu
+                st.write("") 
+            
+            # AI
+            st.header("🤖 AI Consultant")
+            if st.session_state.gemini_key and st.button("✨ Analisa AI"):
+                with st.spinner("AI analyzing..."):
+                    res = generate_ai_strategy(st.session_state.gemini_key, df_show.to_dict('records'), query or f"Trending {region}")
+                    st.markdown(res)
 else:
-    st.markdown("### 👋 Masukkan YouTube API Key di Sidebar.")
+    st.info("Masukkan YouTube API Key di sidebar.")
